@@ -1,21 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, onSnapshot, setDoc, collection, query, orderBy, limit, addDoc, serverTimestamp } from 'firebase/firestore';
+// Removed Firebase imports as they are now loaded globally from the CDN in index.html.
 
 // IMPORTANT: These global variables are provided by the Canvas environment.
 // Do NOT hardcode them or prompt the user for them.
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = {
-    apiKey: "AIzaSyBzSheS6vlFyMT6v23YdwSRDi0CwZei7wU",
-    authDomain: "aura-art-studio-backend.firebaseapp.com",
-    projectId: "aura-art-studio-backend",
-    storageBucket: "aura-art-studio-backend.firebasestorage.app",
-    messagingSenderId: "532667295330",
-    appId: "1:532667295330:web:54fad589a928b12c28933b",
-    measurementId: "G-57L1795M6M"};
 
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
 // Utility function to convert base64 to ArrayBuffer (for audio playback)
 const base64ToArrayBuffer = (base64) => {
   const binaryString = window.atob(base64);
@@ -90,13 +81,21 @@ const App = () => {
 
     // Initialize Firebase and set up auth listener
     useEffect(() => {
-        const app = initializeApp(firebaseConfig);
-        const firestore = getFirestore(app);
-        const firebaseAuth = getAuth(app);
+        // Check if firebase is available globally (loaded from CDN)
+        if (typeof firebase === 'undefined' || typeof firebase.firestore === 'undefined' || typeof firebase.auth === 'undefined') {
+            setErrorMessage("Firebase SDK not loaded. Please ensure it's included in index.html.");
+            return;
+        }
+
+        // Access Firebase services via the global 'firebase' object
+        const app = firebase.app(); // Get the default Firebase app
+        const firestore = firebase.firestore(); // Get Firestore instance
+        const firebaseAuth = firebase.auth(); // Get Auth instance
+
         setDb(firestore);
         setAuth(firebaseAuth);
 
-        const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        const unsubscribe = firebaseAuth.onAuthStateChanged(async (user) => {
             if (user) {
                 setUserId(user.uid);
             } else {
@@ -105,7 +104,7 @@ const App = () => {
                     if (initialAuthToken) {
                         await firebaseAuth.signInWithCustomToken(initialAuthToken);
                     } else {
-                        await signInAnonymously(firebaseAuth);
+                        await firebaseAuth.signInAnonymously();
                     }
                 } catch (error) {
                     console.error("Firebase anonymous sign-in failed:", error);
@@ -115,30 +114,64 @@ const App = () => {
         });
 
         return () => unsubscribe();
-    }, []);
+    }, []); // Empty dependency array means this runs once on mount
+
+    // Redraw canvas function - now a stable useCallback
+    const redrawCanvas = useCallback((dataToDraw) => {
+        const canvas = canvasRef.current;
+        if (!canvas) {
+            // console.log("Canvas not ready for redraw yet."); // For debugging
+            return;
+        }
+        const ctx = canvas.getContext('2d');
+
+        // Clear canvas
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Redraw all strokes
+        dataToDraw.forEach(stroke => {
+            if (stroke.x1 !== undefined && stroke.y1 !== undefined && stroke.x2 !== undefined && stroke.y2 !== undefined) {
+                ctx.beginPath();
+                ctx.moveTo(stroke.x1, stroke.y1);
+                ctx.lineTo(stroke.x2, stroke.y2);
+                ctx.strokeStyle = stroke.color;
+                ctx.lineWidth = stroke.size;
+                ctx.lineCap = 'round';
+                ctx.stroke();
+            } else if (stroke.type === 'image' && stroke.url) {
+                // Draw generated image
+                const img = new Image();
+                img.onload = () => {
+                    // Ensure the image is drawn only after it's loaded
+                    ctx.drawImage(img, stroke.x, stroke.y, stroke.width, stroke.height);
+                };
+                img.src = stroke.url;
+            }
+        });
+    }, []); // No dependencies here, as it takes data as an argument
 
     // Set up Firestore listener for drawing data
     useEffect(() => {
         if (!db || !userId) return;
 
         // Use a public collection for simplicity in this demo
-        const drawingCollectionRef = collection(db, `artifacts/${appId}/public/data/drawings`);
-        const q = query(drawingCollectionRef, orderBy('timestamp', 'asc'), limit(500)); // Limit for performance
+        const drawingCollectionRef = db.collection(`artifacts/${appId}/public/data/drawings`);
+        const q = drawingCollectionRef.orderBy('timestamp', 'asc').limit(500); // Limit for performance
 
-        const unsubscribe = onSnapshot(q, (snapshot) => {
+        const unsubscribe = q.onSnapshot((snapshot) => {
             const data = [];
             snapshot.forEach(doc => {
                 data.push(doc.data());
             });
             setDrawingData(data);
-            redrawCanvas(data); // Redraw canvas when data changes
+            redrawCanvas(data); // Call with the latest data
         }, (error) => {
             console.error("Error fetching drawing data:", error);
             setErrorMessage("Failed to load drawing data. Check console for details.");
         });
 
         return () => unsubscribe();
-    }, [db, userId]);
+    }, [db, userId, redrawCanvas]); // redrawCanvas is now a stable dependency
 
     // Canvas drawing logic
     const draw = useCallback((e) => {
@@ -155,7 +188,7 @@ const App = () => {
         ctx.beginPath();
         ctx.moveTo(lastX, lastY);
         ctx.lineTo(currentX, currentY);
-        ctx.strokeStyle = brushColor;
+        ctx.strokeStyle = currentTool === 'brush' ? brushColor : '#ffffff'; // Eraser uses white color
         ctx.lineWidth = brushSize;
         ctx.lineCap = 'round';
         ctx.stroke();
@@ -169,20 +202,20 @@ const App = () => {
             y1: lastY,
             x2: currentX,
             y2: currentY,
-            color: brushColor,
+            color: currentTool === 'brush' ? brushColor : '#ffffff', // Save eraser strokes as white
             size: brushSize,
             userId: userId, // Include user ID for attribution
-            timestamp: serverTimestamp() // Firestore server timestamp
+            timestamp: firebase.firestore.FieldValue.serverTimestamp() // Firestore server timestamp
         };
 
         // Send stroke to Firestore (batching would be better for performance in a real app)
         if (db) {
-            addDoc(collection(db, `artifacts/${appId}/public/data/drawings`), stroke).catch(error => {
+            db.collection(`artifacts/${appId}/public/data/drawings`).add(stroke).catch(error => {
                 console.error("Error adding drawing stroke to Firestore:", error);
                 setErrorMessage("Failed to save stroke. Please check your connection.");
             });
         }
-    }, [isDrawing, lastX, lastY, brushColor, brushSize, userId, db]);
+    }, [isDrawing, lastX, lastY, brushColor, brushSize, userId, db, currentTool]);
 
     const startDrawing = useCallback((e) => {
         setIsDrawing(true);
@@ -196,39 +229,10 @@ const App = () => {
         setIsDrawing(false);
     }, []);
 
-    const redrawCanvas = useCallback((data) => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-
-        // Clear canvas
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        // Redraw all strokes
-        data.forEach(stroke => {
-            if (stroke.x1 !== undefined && stroke.y1 !== undefined && stroke.x2 !== undefined && stroke.y2 !== undefined) {
-                ctx.beginPath();
-                ctx.moveTo(stroke.x1, stroke.y1);
-                ctx.lineTo(stroke.x2, stroke.y2);
-                ctx.strokeStyle = stroke.color;
-                ctx.lineWidth = stroke.size;
-                ctx.lineCap = 'round';
-                ctx.stroke();
-            } else if (stroke.type === 'image' && stroke.url) {
-                // Draw generated image
-                const img = new Image();
-                img.onload = () => {
-                    ctx.drawImage(img, stroke.x, stroke.y, stroke.width, stroke.height);
-                };
-                img.src = stroke.url;
-            }
-        });
-    }, []);
-
     // Adjust canvas size to fit container
     useEffect(() => {
         const canvas = canvasRef.current;
-        if (canvas) {
+        if (canvas) { // Only proceed if canvasRef.current is available
             const resizeCanvas = () => {
                 // Set canvas dimensions to be responsive
                 canvas.width = canvas.parentElement.clientWidth;
@@ -240,26 +244,15 @@ const App = () => {
             window.addEventListener('resize', resizeCanvas);
             return () => window.removeEventListener('resize', resizeCanvas);
         }
-    }, [drawingData, redrawCanvas]);
-
+    }, [drawingData, redrawCanvas]); // drawingData and redrawCanvas are dependencies
 
     // Function to clear the entire drawing
     const clearCanvas = async () => {
         if (db) {
-            // In a real app, you'd delete all documents in the collection
-            // For simplicity, we'll just clear locally and assume a new session
-            // or a more robust deletion mechanism would be in place.
-            // setDrawingData([]); // This would clear locally
-            // To truly clear the shared canvas, you'd need to delete all docs in Firestore.
-            // This is a more complex operation involving fetching all docs and batch deleting.
-            // For this demo, we'll simulate a clear by setting an empty document
-            // or having a "new session" mechanism.
-            // For now, let's just clear the local state and let Firestore sync.
-            const drawingCollectionRef = collection(db, `artifacts/${appId}/public/data/drawings`);
-            const q = query(drawingCollectionRef);
+            const drawingCollectionRef = db.collection(`artifacts/${appId}/public/data/drawings`);
             try {
-                const snapshot = await getDocs(q);
-                const batch = writeBatch(db); // Use writeBatch for multiple deletions
+                const snapshot = await drawingCollectionRef.get();
+                const batch = db.batch(); // Use writeBatch for multiple deletions
                 snapshot.docs.forEach(doc => {
                     batch.delete(doc.ref);
                 });
@@ -343,9 +336,9 @@ const App = () => {
                     width: imgWidth,
                     height: imgHeight,
                     userId: userId,
-                    timestamp: serverTimestamp()
+                    timestamp: firebase.firestore.FieldValue.serverTimestamp()
                 };
-                addDoc(collection(db, `artifacts/${appId}/public/data/drawings`), imageData).catch(error => {
+                db.collection(`artifacts/${appId}/public/data/drawings`).add(imageData).catch(error => {
                     console.error("Error adding image to Firestore:", error);
                     setErrorMessage("Failed to add image to shared canvas.");
                 });
@@ -356,8 +349,9 @@ const App = () => {
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-purple-100 to-blue-100 flex flex-col items-center justify-center p-4 font-inter">
-            <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
-            <link href="[https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap](https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap)" rel="stylesheet" />
+            {/* Tailwind CSS and Inter font are loaded in index.html now, so these script/link tags are removed from here */}
+            {/* <script src="https://cdn.tailwindcss.com"></script> */}
+            {/* <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" /> */}
 
             <div className="bg-white p-6 rounded-xl shadow-2xl w-full max-w-6xl flex flex-col lg:flex-row gap-6">
                 {/* Control Panel */}
